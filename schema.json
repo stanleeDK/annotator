@@ -1,0 +1,37 @@
+{
+  "project": {
+    "id": "local",
+    "name": "annotater"
+  },
+  "singleshoe": {
+    "feature_schema_id": "cmnqdth8e1ox70720h2io5rt9",
+    "color": "#00ff00"
+  },
+  "classifications": {
+    "SKU": {
+      "feature_schema_id": "cmnqdth8q1oyi0720h6rlhzs4",
+      "type": "text"
+    },
+    "Angle": {
+      "feature_schema_id": "cmnqdth8k1oxd07200k831cf2",
+      "type": "radio",
+      "options": [
+        {"name": "At an Angle", "value": "at_an_angle", "feature_schema_id": "cmnqdth8k1oxm0720cg695504"},
+        {"name": "Back",        "value": "back",         "feature_schema_id": "cmnqdth8k1oxg07206ovicvyt"},
+        {"name": "Front",       "value": "front",        "feature_schema_id": "cmnqdth8k1oxe0720aoud244z"},
+        {"name": "Side",        "value": "side",         "feature_schema_id": "cmnqdth8k1oxo072081qdgg9g"},
+        {"name": "Soles",       "value": "soles",        "feature_schema_id": "cmnqdth8k1oxi0720cgor5d59"},
+        {"name": "Top",         "value": "top",          "feature_schema_id": "cmnqdth8k1oxk07206do1hhng"}
+      ]
+    },
+    "Location": {
+      "feature_schema_id": "cmnqdth8o1oxu07200frpatbs",
+      "type": "radio",
+      "options": [
+        {"name": "In Hand",     "value": "in_hand",     "feature_schema_id": "cmnqdth8o1oxz0720fk6sfgsy"},
+        {"name": "On Foot",     "value": "on_foot",     "feature_schema_id": "cmnqdth8o1oxx0720ddwscqsq"},
+        {"name": "Stand Along", "value": "stand_along", "feature_schema_id": "cmnqdth8o1oxv07202n5x35t3"}
+      ]
+    }
+  }
+}
