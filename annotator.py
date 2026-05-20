@@ -14,7 +14,10 @@ Controls:
 from __future__ import annotations
 
 import json
+import ssl
 import sys
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +30,8 @@ from PyQt6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog,
                              QFormLayout, QGraphicsItem, QGraphicsPixmapItem,
                              QGraphicsRectItem, QGraphicsScene, QGraphicsView,
                              QLabel, QLineEdit, QMainWindow, QMessageBox,
-                             QSizePolicy, QStatusBar, QToolBar, QWidget)
+                             QPlainTextEdit, QSizePolicy, QStatusBar, QToolBar,
+                             QWidget)
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 MIN_BOX_SIZE = 5
@@ -37,6 +41,10 @@ EXIF_ORIENTATION_TAG = 0x0112
 PROJECT_ROOT = Path(__file__).parent
 SCHEMA_PATH = PROJECT_ROOT / "schema.json"
 CONFIG_PATH = PROJECT_ROOT / ".annotater_config.json"
+CREDS_PATH = PROJECT_ROOT / ".annotater_creds.json"
+
+GOAT_LOGIN_URL = "https://sell-api.goat.com/api/v1/unstable/users/login"
+GOAT_USER_AGENT = "alias/1.50.0 (iPhone; iOS 26.4.2; Scale/3.00) Locale/en"
 
 DEFAULT_SCHEMA = {
     "singleshoe": {
@@ -44,6 +52,37 @@ DEFAULT_SCHEMA = {
         "color": "#00ff00",
     }
 }
+
+
+# --- dev: method-call trace ---
+_DEBUG_SINK = None  # set by Main when the dock is built
+
+def _dbg(msg: str):
+    """Send a line to the debug dock if it's been wired up. No-op otherwise."""
+    if _DEBUG_SINK is not None:
+        _DEBUG_SINK(msg)
+
+_NOISY_METHODS = {"mouseMoveEvent", "wheelEvent"}  # skip high-frequency events
+
+def _trace_methods(cls):
+    """Class decorator: wrap every non-dunder method to log its name on entry."""
+    for name, attr in list(cls.__dict__.items()):
+        if callable(attr) and not name.startswith("__") and name not in _NOISY_METHODS:
+            def wrap(n, f):
+                # Qt signals (e.g. QAction.triggered → checked: bool) forward extra
+                # args when the slot signature looks permissive. Match the original
+                # arity so we don't pass Qt-injected extras into a fixed-arg method.
+                code = getattr(f, "__code__", None)
+                has_varargs = bool(code and (code.co_flags & 0x04))
+                argcount = code.co_argcount if code else 999
+                def w(*a, **kw):
+                    _dbg(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}  {cls.__name__}.{n}")
+                    if not has_varargs and len(a) > argcount:
+                        a = a[:argcount]
+                    return f(*a, **kw)
+                return w
+            setattr(cls, name, wrap(name, attr))
+    return cls
 
 
 def load_schema() -> dict:
@@ -101,6 +140,54 @@ def new_feature_id() -> str:
     Called by: BoxItem.to_labelbox_object(), _build_classifications(), _to_export_row().
     """
     return "loc" + uuid.uuid4().hex[:22]
+
+
+def goat_login() -> tuple[dict | None, str]:
+    """Authenticate with the GOAT sell API using creds from .annotater_creds.json.
+
+    Returns:
+        (auth_token_dict, status_message). auth_token_dict is None on failure.
+        status_message is a short human-readable explanation for the status bar.
+    Called by: Main.__init__() after the UI is built.
+    """
+    if not CREDS_PATH.exists():
+        return None, f"GOAT auth: no {CREDS_PATH.name} found — running offline."
+    try:
+        creds = json.loads(CREDS_PATH.read_text())
+        body = json.dumps({
+            "grant_type": "password",
+            "username": creds["username"],
+            "password": creds["password"],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            GOAT_LOGIN_URL,
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": GOAT_USER_AGENT,
+            },
+            method="POST",
+        )
+        # Python's stdlib doesn't read macOS keychain trust roots; corporate / MITM
+        # proxies (or even just an outdated CA bundle) cause CERTIFICATE_VERIFY_FAILED
+        # here even though curl works. This is a dev-only tool hitting an internal
+        # API, so we skip verification deliberately.
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            payload = json.loads(resp.read())
+        token = payload.get("auth_token") or {}
+        if not token.get("access_token"):
+            return None, "GOAT auth: response missing access_token."
+        user = payload.get("user") or {}
+        who = user.get("email") or user.get("username") or "unknown"
+        return token, f"GOAT auth: logged in as {who}."
+    except urllib.error.HTTPError as e:
+        return None, f"GOAT auth: HTTP {e.code} — running offline."
+    except Exception as e:
+        return None, f"GOAT auth: {type(e).__name__} — running offline."
 
 
 def load_oriented(path: Path):
@@ -181,6 +268,7 @@ class ResizeHandle(QGraphicsRectItem):
         ev.accept()
 
 
+@_trace_methods
 class BoxItem(QGraphicsRectItem):
     """Rect is held in local coords; scene position is via pos()."""
 
@@ -298,6 +386,7 @@ class BoxItem(QGraphicsRectItem):
         }
 
 
+@_trace_methods
 class AnnotationView(QGraphicsView):
     def __init__(self, main: "Main"):
         """Set up the central graphics view used for displaying and annotating images.
@@ -450,6 +539,7 @@ class AnnotationView(QGraphicsView):
         super().keyPressEvent(ev)
 
 
+@_trace_methods
 class Main(QMainWindow):
     def __init__(self):
         """Initialize the main application window, loading schema and building all UI components.
@@ -475,12 +565,37 @@ class Main(QMainWindow):
         self._ndjson_all_rows: dict[str, dict] = {}   # keyed by original external_id from file
         self._ndjson_ext_id_map: dict[str, str] = {}  # canonical filename -> original external_id
 
+        self.auth_token: dict | None = None  # populated by goat_login() below if creds exist
+
         self.view = AnnotationView(self)
         self.setCentralWidget(self.view)
         self._build_toolbar()
         self._build_info_bar()
         self._build_sidebar()
         self.setStatusBar(QStatusBar())
+
+        # --- dev: hidden debug log dock (Cmd/Ctrl+Shift+D to toggle) ---
+        self._debug_text = QPlainTextEdit()
+        self._debug_text.setReadOnly(True)
+        self._debug_text.setMaximumBlockCount(500)
+        dbg_dock = QDockWidget("Debug log", self)
+        dbg_dock.setWidget(self._debug_text)
+        dbg_dock.hide()
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dbg_dock)
+        self._toolbar.addSeparator()
+        toggle = QAction("Debug log", self)
+        toggle.setShortcut(QKeySequence("Ctrl+Shift+D"))
+        toggle.setToolTip("Toggle dev debug log dock (Cmd/Ctrl+Shift+D)")
+        toggle.triggered.connect(lambda: dbg_dock.setVisible(not dbg_dock.isVisible()))
+        self._toolbar.addAction(toggle)
+        global _DEBUG_SINK
+        _DEBUG_SINK = self._debug_text.appendPlainText
+
+        # --- auth: log in to GOAT API (best-effort; does not block the UI) ---
+        self.auth_token, auth_msg = goat_login()
+        self.statusBar().showMessage(auth_msg, 8000)
+        _dbg(f"auth: {auth_msg}")
+
         self.refresh_status()
         self._refresh_info_bar()
 
@@ -493,6 +608,7 @@ class Main(QMainWindow):
         tb = QToolBar()
         tb.setMovable(False)
         self.addToolBar(tb)
+        self._toolbar = tb
 
         act_open = QAction("Open Folder", self)
         act_open.triggered.connect(self.open_folder)
