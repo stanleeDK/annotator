@@ -13,9 +13,12 @@ Controls:
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -23,15 +26,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image, ImageOps
-from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtCore import Qt, QRectF, QUrl
 from PyQt6.QtGui import (QAction, QBrush, QColor, QImage, QKeySequence,
                          QPainter, QPen, QPixmap)
+from PyQt6.QtNetwork import (QNetworkAccessManager, QNetworkReply,
+                             QNetworkRequest)
 from PyQt6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog,
-                             QFormLayout, QGraphicsItem, QGraphicsPixmapItem,
-                             QGraphicsRectItem, QGraphicsScene, QGraphicsView,
-                             QLabel, QLineEdit, QMainWindow, QMessageBox,
-                             QPlainTextEdit, QSizePolicy, QStatusBar, QToolBar,
-                             QWidget)
+                             QFormLayout, QFrame, QGraphicsItem,
+                             QGraphicsPixmapItem, QGraphicsRectItem,
+                             QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel,
+                             QLineEdit, QMainWindow, QMessageBox,
+                             QPlainTextEdit, QPushButton, QScrollArea,
+                             QSizePolicy, QStatusBar, QTabWidget, QToolBar,
+                             QVBoxLayout, QWidget)
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 MIN_BOX_SIZE = 5
@@ -44,6 +51,9 @@ CONFIG_PATH = PROJECT_ROOT / ".annotater_config.json"
 CREDS_PATH = PROJECT_ROOT / ".annotater_creds.json"
 
 GOAT_LOGIN_URL = "https://sell-api.goat.com/api/v1/unstable/users/login"
+GOAT_VISUAL_SEARCH_URL = (
+    "https://gateway.alias.org/api/v1alpha1/visual-search/resolve-product-template-from-image"
+)
 GOAT_USER_AGENT = "alias/1.50.0 (iPhone; iOS 26.4.2; Scale/3.00) Locale/en"
 
 DEFAULT_SCHEMA = {
@@ -62,26 +72,46 @@ def _dbg(msg: str):
     if _DEBUG_SINK is not None:
         _DEBUG_SINK(msg)
 
-_NOISY_METHODS = {"mouseMoveEvent", "wheelEvent"}  # skip high-frequency events
+_NOISY_METHODS = {"mouseMoveEvent", "wheelEvent", "_on_thumb_loaded"}  # skip high-frequency events
 
 def _trace_methods(cls):
     """Class decorator: wrap every non-dunder method to log its name on entry."""
     for name, attr in list(cls.__dict__.items()):
-        if callable(attr) and not name.startswith("__") and name not in _NOISY_METHODS:
-            def wrap(n, f):
-                # Qt signals (e.g. QAction.triggered → checked: bool) forward extra
-                # args when the slot signature looks permissive. Match the original
-                # arity so we don't pass Qt-injected extras into a fixed-arg method.
-                code = getattr(f, "__code__", None)
-                has_varargs = bool(code and (code.co_flags & 0x04))
-                argcount = code.co_argcount if code else 999
-                def w(*a, **kw):
-                    _dbg(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}  {cls.__name__}.{n}")
-                    if not has_varargs and len(a) > argcount:
-                        a = a[:argcount]
-                    return f(*a, **kw)
-                return w
-            setattr(cls, name, wrap(name, attr))
+        if name.startswith("__") or name in _NOISY_METHODS:
+            continue
+        # Detect static/class methods so we can unwrap them, wrap the underlying
+        # function, and re-decorate with the same wrapper kind. Wrapping a
+        # staticmethod naively turns it into an instance method and Python
+        # would inject `self` at call time, breaking the signature.
+        is_static = isinstance(attr, staticmethod)
+        is_class = isinstance(attr, classmethod)
+        if is_static or is_class:
+            fn = attr.__func__
+        elif callable(attr):
+            fn = attr
+        else:
+            continue
+
+        def wrap(n, f):
+            # Qt signals (e.g. QAction.triggered → checked: bool) forward extra
+            # args when the slot signature looks permissive. Match the original
+            # arity so we don't pass Qt-injected extras into a fixed-arg method.
+            code = getattr(f, "__code__", None)
+            has_varargs = bool(code and (code.co_flags & 0x04))
+            argcount = code.co_argcount if code else 999
+            def w(*a, **kw):
+                _dbg(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}  {cls.__name__}.{n}")
+                if not has_varargs and len(a) > argcount:
+                    a = a[:argcount]
+                return f(*a, **kw)
+            return w
+
+        wrapped = wrap(name, fn)
+        if is_static:
+            wrapped = staticmethod(wrapped)
+        elif is_class:
+            wrapped = classmethod(wrapped)
+        setattr(cls, name, wrapped)
     return cls
 
 
@@ -142,7 +172,14 @@ def new_feature_id() -> str:
     return "loc" + uuid.uuid4().hex[:22]
 
 
+
 def goat_login() -> tuple[dict | None, str]:
+  #   curl -i -X POST 'https://sell-api.goat.com/api/v1/unstable/users/login' \
+  # -H 'Accept: application/json' \
+  # -H 'Content-Type: application/json' \
+  # -H 'User-Agent: alias/1.50.0 (iPhone; iOS 26.4.2; Scale/3.00) Locale/en' \
+  # --data-raw '{"grant_type":"password","username":"stanleylee13@yahoo.com","password":"33333333"}' \
+  # --proxy http://localhost:9090
     """Authenticate with the GOAT sell API using creds from .annotater_creds.json.
 
     Returns:
@@ -188,6 +225,56 @@ def goat_login() -> tuple[dict | None, str]:
         return None, f"GOAT auth: HTTP {e.code} — running offline."
     except Exception as e:
         return None, f"GOAT auth: {type(e).__name__} — running offline."
+
+
+def goat_visual_search(image_bytes: bytes, auth_token: dict) -> tuple[dict | None, str, int]:
+    """POST a JPEG/PNG byte blob as base64 to the visual-search endpoint.
+
+    Args:
+        image_bytes: Raw encoded image bytes (e.g. JPEG of a cropped region).
+        auth_token: Token dict from goat_login() — must contain "access_token".
+    Returns:
+        (payload_dict | None, status_message, http_status). http_status is -1 on
+        network error. Callers should check for status == 401 to trigger an auth
+        refresh + retry.
+    Called by: Main._refresh_visual_search() after cropping the current image.
+    """
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    body = json.dumps({"base64_data": b64}).encode("utf-8")
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {auth_token.get('access_token','')}",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": GOAT_USER_AGENT,
+        "Content-Type": "application/json",
+        # x-emb-st = current request timestamp in ms; the mobile client sends this
+        # and the origin can be picky about its presence.
+        "x-emb-st": str(int(time.time() * 1000)),
+        "Connection": "keep-alive",
+    }
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    # Retry once on 502/503/504 — they're usually transient origin hiccups.
+    for attempt in (1, 2):
+        req = urllib.request.Request(GOAT_VISUAL_SEARCH_URL, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                return json.loads(resp.read()), "visual search: ok", resp.status
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = "<no body>"
+            snippet = err_body.strip().replace("\n", " ")[:200]
+            if e.code in (502, 503, 504) and attempt == 1:
+                time.sleep(1.0)
+                continue  # retry once
+            return None, f"visual search: HTTP {e.code} — {snippet}", e.code
+        except Exception as e:
+            return None, f"visual search: {type(e).__name__} — {e}", -1
+    return None, "visual search: unreachable", -1
 
 
 def load_oriented(path: Path):
@@ -385,6 +472,29 @@ class BoxItem(QGraphicsRectItem):
             },
         }
 
+    def set_is_search_target(self, on: bool):
+        """Paint/unpaint the orange 'this crop was sent to visual search' highlight.
+
+        On True, saves the current pen and applies a thicker orange border.
+        On False, restores the saved pen so the box returns to its source color.
+        Idempotent — safe to call repeatedly.
+        Called by: Main._set_search_box().
+        """
+        is_target = getattr(self, "_is_search_target", False)
+        if on and not is_target:
+            self._saved_pen = QPen(self.pen())
+            self._saved_brush = QBrush(self.brush())
+            # Bright blue, thicker border, slightly more saturated fill for clarity.
+            blue = QColor("#1d4ed8")  # tailwind blue-700
+            self.setPen(QPen(blue, 6))
+            fill = QColor(blue.red(), blue.green(), blue.blue(), 70)
+            self.setBrush(QBrush(fill))
+            self._is_search_target = True
+        elif not on and is_target:
+            self.setPen(self._saved_pen)
+            self.setBrush(self._saved_brush)
+            self._is_search_target = False
+
 
 @_trace_methods
 class AnnotationView(QGraphicsView):
@@ -405,6 +515,17 @@ class AnnotationView(QGraphicsView):
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._drawing: BoxItem | None = None
         self._start_scene = None
+        self._scene.selectionChanged.connect(self._on_selection_changed)
+
+    def _on_selection_changed(self):
+        """When the user clicks a BoxItem, notify Main to switch visual-search target.
+
+        Filters to BoxItems only (ResizeHandle selections are ignored).
+        Called by: QGraphicsScene.selectionChanged signal.
+        """
+        selected_boxes = [i for i in self._scene.selectedItems() if isinstance(i, BoxItem)]
+        if selected_boxes:
+            self.main._on_search_box_clicked(selected_boxes[0])
 
     def clear_all(self):
         """Remove all items from the scene and reset internal state.
@@ -566,6 +687,7 @@ class Main(QMainWindow):
         self._ndjson_ext_id_map: dict[str, str] = {}  # canonical filename -> original external_id
 
         self.auth_token: dict | None = None  # populated by goat_login() below if creds exist
+        self._search_box: "BoxItem | None" = None  # active visual-search target on canvas
 
         self.view = AnnotationView(self)
         self.setCentralWidget(self.view)
@@ -574,19 +696,88 @@ class Main(QMainWindow):
         self._build_sidebar()
         self.setStatusBar(QStatusBar())
 
-        # --- dev: hidden debug log dock (Cmd/Ctrl+Shift+D to toggle) ---
+        # --- bottom dock: tabbed pane with Visual search + Debug log ---
+        self._carousel_host = QWidget()
+        self._carousel_layout = QHBoxLayout(self._carousel_host)
+        self._carousel_layout.setContentsMargins(6, 6, 6, 6)
+        self._carousel_layout.setSpacing(8)
+        self._carousel_layout.addStretch(1)  # keeps cards left-aligned
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(self._carousel_host)
+
         self._debug_text = QPlainTextEdit()
         self._debug_text.setReadOnly(True)
         self._debug_text.setMaximumBlockCount(500)
-        dbg_dock = QDockWidget("Debug log", self)
-        dbg_dock.setWidget(self._debug_text)
-        dbg_dock.hide()
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dbg_dock)
+
+        # Crop preview tab — shows the exact image bytes being POSTed
+        self._crop_preview_tab = QWidget()
+        cp_layout = QVBoxLayout(self._crop_preview_tab)
+        cp_layout.setContentsMargins(8, 8, 8, 8)
+        cp_layout.setSpacing(6)
+
+        # Top row: metadata text on the left, Download button on the right
+        cp_top = QHBoxLayout()
+        cp_top.setContentsMargins(0, 0, 0, 0)
+        self._crop_preview_meta = QLabel("(no crop yet)")
+        self._crop_preview_meta.setStyleSheet("font-family: monospace; color: #444;")
+        self._crop_download_btn = QPushButton("Download JPEG")
+        self._crop_download_btn.setEnabled(False)
+        self._crop_download_btn.setToolTip("Save the current cropped image to disk as a JPEG")
+        self._crop_download_btn.clicked.connect(self._download_crop)
+        cp_top.addWidget(self._crop_preview_meta, 1)
+        cp_top.addWidget(self._crop_download_btn, 0)
+
+        self._crop_preview_img = QLabel()
+        self._crop_preview_img.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        self._crop_preview_img.setStyleSheet("background: #f5f5f5;")
+        # The crop can be much taller than the dock — wrap in a scroll area so
+        # the user can scroll to see the full image (and confirm nothing's
+        # actually being cut off in the JPEG that gets POSTed).
+        cp_scroll = QScrollArea()
+        cp_scroll.setWidgetResizable(True)
+        cp_scroll.setWidget(self._crop_preview_img)
+        cp_layout.addLayout(cp_top)
+        cp_layout.addWidget(cp_scroll, 1)
+
+        # Cached bytes of the most-recently-generated crop, for the Download button.
+        self._last_crop_bytes: bytes | None = None
+
+        self._bottom_tabs = QTabWidget()
+        self._bottom_tabs.addTab(scroll, "Visual search")
+        self._bottom_tabs.addTab(self._crop_preview_tab, "Crop preview")
+        self._bottom_tabs.addTab(self._debug_text, "Debug log")
+        self._bottom_tabs.setStyleSheet(
+            "QTabBar::tab { padding: 6px 18px; min-width: 110px; }"
+            "QTabBar::tab:selected { background: #f0f0f0; font-weight: bold; }"
+        )
+
+        bottom_dock = QDockWidget("", self)
+        bottom_dock.setTitleBarWidget(QWidget())  # hide native dock title — tabs are the label
+        bottom_dock.setWidget(self._bottom_tabs)
+        bottom_dock.setMinimumHeight(240)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, bottom_dock)
+
+        # QNetworkAccessManager for async thumbnail downloads
+        self._netmgr = QNetworkAccessManager(self)
+        self._netmgr.finished.connect(self._on_thumb_loaded)
+        # url -> list of target labels (list, not single, because multiple
+        # templates can share the same image_url — color variants etc).
+        self._pending_thumbs: dict[str, list[QLabel]] = {}
+
+        # Cmd/Ctrl+Shift+D toggles between the two tabs
         self._toolbar.addSeparator()
         toggle = QAction("Debug log", self)
         toggle.setShortcut(QKeySequence("Ctrl+Shift+D"))
-        toggle.setToolTip("Toggle dev debug log dock (Cmd/Ctrl+Shift+D)")
-        toggle.triggered.connect(lambda: dbg_dock.setVisible(not dbg_dock.isVisible()))
+        toggle.setToolTip("Switch between Visual search and Debug log tabs (Cmd/Ctrl+Shift+D)")
+        toggle.triggered.connect(
+            lambda: self._bottom_tabs.setCurrentIndex(
+                (self._bottom_tabs.currentIndex() + 1) % self._bottom_tabs.count()
+            )
+        )
         self._toolbar.addAction(toggle)
         global _DEBUG_SINK
         _DEBUG_SINK = self._debug_text.appendPlainText
@@ -639,6 +830,18 @@ class Main(QMainWindow):
         act_predict.setShortcut(QKeySequence("R"))
         act_predict.triggered.connect(self.run_predictor)
         tb.addAction(act_predict)
+
+        tb.addSeparator()
+
+        tb.addWidget(QLabel(" Jump to: "))
+        self.jump_input = QLineEdit()
+        self.jump_input.setPlaceholderText("filename or prefix (e.g. IMG_7168)")
+        self.jump_input.setFixedWidth(240)
+        self.jump_input.setToolTip(
+            "Type a filename, stem, or prefix and press Enter to jump to that image"
+        )
+        self.jump_input.returnPressed.connect(self._jump_to_filename)
+        tb.addWidget(self.jump_input)
 
         tb.addSeparator()
 
@@ -912,6 +1115,9 @@ class Main(QMainWindow):
             QMessageBox.warning(self, "Load error", f"Could not load {path.name}: {exc}")
             return
         self.view.load_pixmap(pixmap)
+        self._search_box = None  # the old reference is now a destroyed Qt object — drop it
+        self._last_crop_bytes = None  # crop from the previous image is no longer relevant
+        self._crop_download_btn.setEnabled(False)
         self._current_media = {
             "height": h,
             "width": w,
@@ -946,6 +1152,7 @@ class Main(QMainWindow):
         self._refresh_info_bar()
         self.sku_input.setFocus()
         self.sku_input.selectAll()
+        self._refresh_visual_search()
 
     def _stash_current(self):
         """Snapshot the current image's boxes and sidebar values into self.annotations.
@@ -971,6 +1178,282 @@ class Main(QMainWindow):
             },
         }
 
+    def _set_search_box(self, box: "BoxItem | None"):
+        """Make `box` the visual-search target, restoring the previous target's color.
+
+        No-op if `box` is already the target.
+        Called by: load_current() (initial pick of boxes[0]) and _on_search_box_clicked().
+        """
+        if self._search_box is box:
+            return
+        if self._search_box is not None:
+            try:
+                self._search_box.set_is_search_target(False)
+            except RuntimeError:
+                pass  # underlying Qt object was destroyed (scene cleared) — ignore
+        self._search_box = box
+        if box is not None:
+            box.set_is_search_target(True)
+
+    def _on_search_box_clicked(self, box: "BoxItem"):
+        """User clicked a different box — switch the search target and re-run.
+
+        Called by: AnnotationView._on_selection_changed() via scene's selectionChanged.
+        """
+        if box is self._search_box:
+            return
+        self._set_search_box(box)
+        self._refresh_visual_search()
+
+    def _crop_search_box_to_jpeg(self, path: Path, max_dim: int = 1024) -> bytes | None:
+        """Return JPEG bytes of `path` cropped to self._search_box's scene rect.
+
+        Uses PIL with exif_transpose so the crop matches the on-screen pixels.
+        Resizes the crop to fit within `max_dim` x `max_dim` so the upload is small
+        enough for the visual-search API (large iPhone crops have caused 502s).
+        Returns None when no search box is set.
+        Called by: _refresh_visual_search().
+        """
+        if self._search_box is None:
+            return None
+        r = self._search_box.scene_rect()
+        left, top = max(0, int(r.left())), max(0, int(r.top()))
+        right, bottom = int(r.right()), int(r.bottom())
+        with Image.open(path) as pil:
+            oriented = ImageOps.exif_transpose(pil).convert("RGB")
+        crop = oriented.crop((left, top, right, bottom))
+        orig_w, orig_h = crop.width, crop.height
+        # Downscale so the long edge is at most max_dim (preserves aspect ratio).
+        if max(crop.width, crop.height) > max_dim:
+            crop.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        _dbg(f"visual search: crop resized to {crop.width}x{crop.height}")
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=85)
+        data = buf.getvalue()
+
+        # Update the Crop preview tab so the user can verify exactly what was sent.
+        pm = QPixmap()
+        pm.loadFromData(data)
+        self._crop_preview_img.setPixmap(pm.scaledToWidth(
+            min(pm.width(), 500), Qt.TransformationMode.SmoothTransformation
+        ))
+        kb = len(data) / 1024
+        self._crop_preview_meta.setText(
+            f"source crop: {orig_w}×{orig_h}    sent: {crop.width}×{crop.height}    "
+            f"size: {len(data):,} bytes ({kb:.1f} KB)"
+        )
+        # Cache for the Download button.
+        self._last_crop_bytes = data
+        self._crop_download_btn.setEnabled(True)
+        return data
+
+    def _download_crop(self):
+        """Save the most-recently-generated crop JPEG to disk via a file dialog.
+
+        Suggests a filename based on the current image's stem and the box position
+        so multiple crops from the same image don't collide. Called by:
+        the "Download JPEG" button on the Crop preview tab.
+        """
+        if not self._last_crop_bytes:
+            self.statusBar().showMessage("No crop available to download.", 4000)
+            return
+        # Build a sensible default filename: <image_stem>_crop.jpg in the image's folder.
+        if self.image_paths and 0 <= self.index < len(self.image_paths):
+            src = self.image_paths[self.index]
+            default = str(src.with_name(f"{src.stem}_crop.jpg"))
+        else:
+            default = "crop.jpg"
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save cropped image", default, "JPEG (*.jpg *.jpeg);;All files (*)"
+        )
+        if not out:
+            return
+        try:
+            Path(out).write_bytes(self._last_crop_bytes)
+        except OSError as e:
+            QMessageBox.warning(self, "Save failed", f"Could not write {out}:\n{e}")
+            return
+        self.statusBar().showMessage(f"Saved crop to {out}", 5000)
+        _dbg(f"crop saved: {out} ({len(self._last_crop_bytes):,} bytes)")
+
+    def _refresh_visual_search(self):
+        """Crop the active search box, POST to visual-search, populate the carousel.
+
+        If no search box is set yet (first run for a new image), defaults to the first
+        box on the canvas (highest-confidence predictor result, or first NDJSON object).
+        Handles HTTP 401 transparently by calling goat_login() once and retrying.
+        Called by: load_current() at the end, and _on_search_box_clicked().
+        """
+        self._clear_carousel()
+        boxes = self.view.boxes()
+        _dbg(f"visual search check: image_paths={len(self.image_paths)} "
+             f"auth_token={'yes' if self.auth_token else 'NO'} "
+             f"boxes={len(boxes)}")
+        if not self.image_paths:
+            self.statusBar().showMessage("Visual search skipped — no image loaded.", 5000)
+            _dbg("visual search: no image loaded.")
+            return
+        if not boxes:
+            self.statusBar().showMessage("Visual search skipped — no bounding box on canvas.", 5000)
+            _dbg("visual search: no boxes on canvas.")
+            return
+        if not self.auth_token:
+            self.statusBar().showMessage(
+                "Visual search skipped — not authenticated. Check .annotater_creds.json.", 8000
+            )
+            _dbg("visual search: no auth token (login failed earlier).")
+            return
+        if self._search_box is None:
+            self._set_search_box(boxes[0])
+        path = self.image_paths[self.index]
+
+        self.statusBar().showMessage("Cropping image to bounding box…")
+        QApplication.processEvents()
+        r = self._search_box.scene_rect()
+        _dbg(f"visual search: cropping rect=({int(r.left())},{int(r.top())},"
+             f"{int(r.width())}x{int(r.height())})")
+        crop_bytes = self._crop_search_box_to_jpeg(path)
+        if crop_bytes is None:
+            msg = "Visual search skipped — crop failed."
+            self.statusBar().showMessage(msg, 5000)
+            _dbg(msg)
+            return
+        _dbg(f"visual search: crop is {len(crop_bytes)} bytes; posting…")
+
+        self.statusBar().showMessage("Calling visual search API…")
+        QApplication.processEvents()
+        payload, msg, code = goat_visual_search(crop_bytes, self.auth_token)
+        # Surface FULL response detail in the debug log; status bar gets the short version.
+        _dbg(f"visual search response: code={code} msg={msg}")
+
+        if code == 401:
+            warn = f"Auth expired ({msg}) — refreshing token…"
+            self.statusBar().showMessage(warn)
+            _dbg(warn)
+            QApplication.processEvents()
+            self.auth_token, login_msg = goat_login()
+            _dbg(f"auth refresh: {login_msg}")
+            if not self.auth_token:
+                self.statusBar().showMessage(f"Re-login failed: {login_msg}", 8000)
+                return
+            payload, msg, code = goat_visual_search(crop_bytes, self.auth_token)
+
+        if payload is None:
+            self.statusBar().showMessage(msg, 5000)
+            _dbg(msg)
+            return
+        items = payload.get("catalog_items") or []
+        self.statusBar().showMessage(f"Visual search: {len(items)} matches.", 3000)
+        _dbg(f"visual search: {len(items)} catalog items returned.")
+        _dbg("visual search payload:\n" + json.dumps(payload, indent=2))
+        self._populate_carousel(items)
+
+    def _clear_carousel(self):
+        """Remove all cards from the carousel and abort pending image downloads."""
+        self._pending_thumbs.clear()
+        while self._carousel_layout.count() > 1:
+            item = self._carousel_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _populate_carousel(self, items: list[dict]):
+        """Build one card per catalog_item in array order (left-to-right).
+
+        Each card: QFrame with QVBoxLayout — name, sku, slug, id labels above two
+        stacked image labels (grid_glow_picture_url on top, main_glow_picture_url
+        below). Image downloads are kicked off async via QNetworkAccessManager.
+        Duplicate image URLs (e.g. multiple cards sharing the same grid image)
+        are tracked as a list so every card's thumbnail gets populated.
+        """
+        _dbg(f"visual search: building {len(items)} cards")
+        for item in items:
+            card = QFrame()
+            card.setFrameShape(QFrame.Shape.StyledPanel)
+            card.setFixedWidth(170)
+            v = QVBoxLayout(card)
+            v.setContentsMargins(6, 6, 6, 6)
+            v.setSpacing(2)
+
+            name = QLabel(str(item.get("name", "")))
+            name.setWordWrap(True)
+            name.setStyleSheet("font-weight: bold;")
+            sku = QLabel("SKU: " + str(item.get("sku", "")))
+            sku.setStyleSheet("color: #1d4ed8; font-size: 11px; font-weight: bold;")
+            sku.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            sku.setCursor(Qt.CursorShape.IBeamCursor)
+            sku.setToolTip("Click and drag to select, then Cmd/Ctrl+C to copy")
+            slug = QLabel(str(item.get("slug", "")))
+            slug.setStyleSheet("color: #666; font-size: 10px;")
+            id_lbl = QLabel(str(item.get("id", "")))
+            id_lbl.setStyleSheet("color: #888; font-size: 9px;")
+
+            grid_lbl = self._make_thumb_label()
+            main_lbl = self._make_thumb_label()
+
+            v.addWidget(name)
+            v.addWidget(sku)
+            v.addWidget(slug)
+            v.addWidget(id_lbl)
+            v.addWidget(QLabel("grid:"))
+            v.addWidget(grid_lbl)
+            v.addWidget(QLabel("main:"))
+            v.addWidget(main_lbl)
+
+            self._carousel_layout.insertWidget(self._carousel_layout.count() - 1, card)
+
+            for url, label in (
+                (item.get("grid_glow_picture_url"), grid_lbl),
+                (item.get("main_glow_picture_url"), main_lbl),
+            ):
+                if not url:
+                    label.setText("(no url)")
+                    continue
+                existing = self._pending_thumbs.setdefault(url, [])
+                existing.append(label)
+                # Only fire the GET once per unique URL; reuse the bytes
+                # for any additional cards sharing this image_url.
+                if len(existing) == 1:
+                    self._netmgr.get(QNetworkRequest(QUrl(url)))
+
+    def _make_thumb_label(self) -> QLabel:
+        """Create a placeholder QLabel used to host a downloaded carousel thumbnail."""
+        lbl = QLabel("loading…")
+        lbl.setFixedSize(150, 100)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet("background:#eee; color:#888;")
+        return lbl
+
+    def _on_thumb_loaded(self, reply: "QNetworkReply"):
+        """QNetworkAccessManager.finished slot — set downloaded image onto ALL labels sharing this URL."""
+        url = reply.request().url().toString()
+        labels = self._pending_thumbs.pop(url, [])
+        if not labels:
+            reply.deleteLater()
+            return
+        if reply.error() != QNetworkReply.NetworkError.NoError:
+            for label in labels:
+                label.setText("(image error)")
+        else:
+            data = reply.readAll()
+            pm = QPixmap()
+            if pm.loadFromData(data):
+                scaled = pm.scaled(
+                    150, 100,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                for label in labels:
+                    label.setPixmap(scaled)
+            else:
+                for label in labels:
+                    label.setText("(decode error)")
+        reply.deleteLater()
+
     def prev_image(self):
         """Stash the current image and navigate to the previous one in the list.
 
@@ -992,6 +1475,49 @@ class Main(QMainWindow):
             self._stash_current()
             self.index += 1
             self.load_current()
+
+    def _jump_to_filename(self):
+        """Skip to the first image whose filename matches the Jump-to input.
+
+        Matching is case-insensitive and tries, in order: exact name, exact stem
+        (without extension), prefix of name, substring of name. Useful for
+        resuming work where you left off without pressing Next many times.
+        Called by: the Jump-to QLineEdit's returnPressed signal (Enter key).
+        """
+        if not self.image_paths:
+            self.statusBar().showMessage("Open a folder first.", 4000)
+            return
+        query = self.jump_input.text().strip().lower()
+        if not query:
+            return
+        names_lc = [p.name.lower() for p in self.image_paths]
+        stems_lc = [p.stem.lower() for p in self.image_paths]
+
+        idx = None
+        if query in names_lc:
+            idx = names_lc.index(query)
+        elif query in stems_lc:
+            idx = stems_lc.index(query)
+        else:
+            for i, n in enumerate(names_lc):
+                if n.startswith(query):
+                    idx = i
+                    break
+            if idx is None:
+                for i, n in enumerate(names_lc):
+                    if query in n:
+                        idx = i
+                        break
+
+        if idx is None:
+            self.statusBar().showMessage(f"No image matches '{query}'.", 4000)
+            _dbg(f"jump: no match for '{query}'")
+            return
+
+        self._stash_current()
+        self.index = idx
+        self.load_current()
+        self.jump_input.clear()
 
     def refresh_status(self):
         """Update the status bar with the current image index, filename, box count, and label.
