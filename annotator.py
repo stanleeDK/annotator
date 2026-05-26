@@ -22,10 +22,12 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from PyQt6.QtCore import Qt, QRectF, QUrl
 from PyQt6.QtGui import (QAction, QBrush, QColor, QImage, QKeySequence,
                          QPainter, QPen, QPixmap)
@@ -36,9 +38,9 @@ from PyQt6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog,
                              QGraphicsPixmapItem, QGraphicsRectItem,
                              QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel,
                              QLineEdit, QMainWindow, QMessageBox,
-                             QPlainTextEdit, QPushButton, QScrollArea,
-                             QSizePolicy, QStatusBar, QTabWidget, QToolBar,
-                             QVBoxLayout, QWidget)
+                             QPlainTextEdit, QProgressDialog, QPushButton,
+                             QScrollArea, QSizePolicy, QStatusBar, QTabBar,
+                             QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 MIN_BOX_SIZE = 5
@@ -213,7 +215,11 @@ def goat_login() -> tuple[dict | None, str]:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": "http://localhost:9090", "https": "http://localhost:9090"}),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+        with opener.open(req, timeout=10) as resp:
             payload = json.loads(resp.read())
         token = payload.get("auth_token") or {}
         if not token.get("access_token"):
@@ -255,12 +261,16 @@ def goat_visual_search(image_bytes: bytes, auth_token: dict) -> tuple[dict | Non
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": "http://localhost:9090", "https": "http://localhost:9090"}),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
 
     # Retry once on 502/503/504 — they're usually transient origin hiccups.
     for attempt in (1, 2):
         req = urllib.request.Request(GOAT_VISUAL_SEARCH_URL, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            with opener.open(req, timeout=15) as resp:
                 return json.loads(resp.read()), "visual search: ok", resp.status
         except urllib.error.HTTPError as e:
             try:
@@ -275,6 +285,39 @@ def goat_visual_search(image_bytes: bytes, auth_token: dict) -> tuple[dict | Non
         except Exception as e:
             return None, f"visual search: {type(e).__name__} — {e}", -1
     return None, "visual search: unreachable", -1
+
+
+@dataclass
+class BulkResult:
+    """One row of bulk-mode evaluation: a single bounding-box crop and the API ranking it produced.
+
+    Fields:
+        path: Source image path.
+        gt_sku: Ground-truth SKU for that image (from NDJSON image-level classification).
+            All boxes in one image share the same gt_sku.
+        rect: (left, top, width, height) display-space pixels of this bounding box.
+        items: API's catalog_items in returned order. Each item dict has sku/name/slug/id/
+            grid_glow_picture_url etc. Empty on crop or network failure.
+        status: Human-readable status string from goat_visual_search() (or "crop failed").
+        crop_jpeg: JPEG bytes actually POSTed, retained so the report can display the crop.
+    """
+    path: Path
+    gt_sku: str
+    rect: tuple[int, int, int, int]
+    items: list[dict]
+    status: str
+    crop_jpeg: bytes | None = None
+
+    def rank(self) -> int | None:
+        """0-based index of gt_sku in items (case-insensitive, trimmed); None if not present
+        or if gt_sku is empty. Used by _compute_stats and report rendering."""
+        gt = (self.gt_sku or "").strip().casefold()
+        if not gt:
+            return None
+        for i, it in enumerate(self.items):
+            if str(it.get("sku", "")).strip().casefold() == gt:
+                return i
+        return None
 
 
 def load_oriented(path: Path):
@@ -690,7 +733,23 @@ class Main(QMainWindow):
         self._search_box: "BoxItem | None" = None  # active visual-search target on canvas
 
         self.view = AnnotationView(self)
-        self.setCentralWidget(self.view)
+        # Wrap the canvas in a tab widget so bulk-mode results can appear as a
+        # second tab. The Annotate tab is non-closeable (close button removed
+        # below); closing the Bulk results tab calls _exit_bulk_mode.
+        self._canvas_tabs = QTabWidget()
+        self._canvas_tabs.setTabsClosable(True)
+        self._canvas_tabs.tabCloseRequested.connect(self._on_canvas_tab_close)
+        self._canvas_tabs.addTab(self.view, "Annotate")
+        try:
+            self._canvas_tabs.tabBar().setTabButton(0, QTabBar.ButtonPosition.RightSide, None)
+        except Exception:
+            # On some platforms the close button lives on the left side.
+            self._canvas_tabs.tabBar().setTabButton(0, QTabBar.ButtonPosition.LeftSide, None)
+        self.setCentralWidget(self._canvas_tabs)
+        # Bulk-mode state (populated when the user runs Bulk mode):
+        self._bulk_tab_index: int | None = None
+        self._bulk_report_pixmap: QPixmap | None = None
+        self._bulk_report_png_bytes: bytes | None = None
         self._build_toolbar()
         self._build_info_bar()
         self._build_sidebar()
@@ -813,6 +872,17 @@ class Main(QMainWindow):
         act_load = QAction("Load NDJSON", self)
         act_load.triggered.connect(self.load_ndjson)
         tb.addAction(act_load)
+
+        # Bulk mode — disabled until both a folder of images and an NDJSON
+        # have been loaded. Enabled by _maybe_enable_bulk_mode().
+        self._bulk_action = QAction("Bulk mode", self)
+        self._bulk_action.setToolTip(
+            "Run visual search across every bounding box in the loaded NDJSON "
+            "and render a recall report. Requires a folder + NDJSON."
+        )
+        self._bulk_action.setEnabled(False)
+        self._bulk_action.triggered.connect(self._start_bulk_mode)
+        tb.addAction(self._bulk_action)
 
         tb.addSeparator()
 
@@ -1054,6 +1124,7 @@ class Main(QMainWindow):
         self.annotations = {}
         self.index = 0
         self.load_current()
+        self._maybe_enable_bulk_mode()
 
     def open_image(self):
         """Prompt the user to open a single image, replacing the current image list with just that file.
@@ -1205,47 +1276,76 @@ class Main(QMainWindow):
         self._set_search_box(box)
         self._refresh_visual_search()
 
-    def _crop_search_box_to_jpeg(self, path: Path, max_dim: int = 1024) -> bytes | None:
-        """Return JPEG bytes of `path` cropped to self._search_box's scene rect.
+    def _crop_image_to_rect_jpeg(
+        self,
+        path: Path,
+        rect_xywh: tuple[int, int, int, int],
+        max_dim: int = 1024,
+        update_preview: bool = True,
+    ) -> bytes | None:
+        """Crop `path` to (left, top, width, height) display-space pixels and JPEG-encode.
 
         Uses PIL with exif_transpose so the crop matches the on-screen pixels.
         Resizes the crop to fit within `max_dim` x `max_dim` so the upload is small
         enough for the visual-search API (large iPhone crops have caused 502s).
-        Returns None when no search box is set.
-        Called by: _refresh_visual_search().
+        If `update_preview` is True, also pushes the crop into the Crop preview tab
+        and arms the Download JPEG button — set to False for bulk mode so dozens of
+        crops don't churn the preview UI.
+        Returns JPEG bytes, or None on I/O / decode failure.
+        Called by: _crop_search_box_to_jpeg() (single-image flow) and _start_bulk_mode().
         """
-        if self._search_box is None:
+        left, top, w, h = rect_xywh
+        left, top = max(0, int(left)), max(0, int(top))
+        right, bottom = left + max(1, int(w)), top + max(1, int(h))
+        try:
+            with Image.open(path) as pil:
+                oriented = ImageOps.exif_transpose(pil).convert("RGB")
+        except Exception as e:
+            _dbg(f"crop: failed to open {path.name}: {type(e).__name__} — {e}")
             return None
-        r = self._search_box.scene_rect()
-        left, top = max(0, int(r.left())), max(0, int(r.top()))
-        right, bottom = int(r.right()), int(r.bottom())
-        with Image.open(path) as pil:
-            oriented = ImageOps.exif_transpose(pil).convert("RGB")
         crop = oriented.crop((left, top, right, bottom))
         orig_w, orig_h = crop.width, crop.height
         # Downscale so the long edge is at most max_dim (preserves aspect ratio).
         if max(crop.width, crop.height) > max_dim:
             crop.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-        _dbg(f"visual search: crop resized to {crop.width}x{crop.height}")
+        _dbg(f"crop: {path.name} ({orig_w}x{orig_h} -> {crop.width}x{crop.height})")
         buf = io.BytesIO()
         crop.save(buf, format="JPEG", quality=85)
         data = buf.getvalue()
 
-        # Update the Crop preview tab so the user can verify exactly what was sent.
-        pm = QPixmap()
-        pm.loadFromData(data)
-        self._crop_preview_img.setPixmap(pm.scaledToWidth(
-            min(pm.width(), 500), Qt.TransformationMode.SmoothTransformation
-        ))
-        kb = len(data) / 1024
-        self._crop_preview_meta.setText(
-            f"source crop: {orig_w}×{orig_h}    sent: {crop.width}×{crop.height}    "
-            f"size: {len(data):,} bytes ({kb:.1f} KB)"
-        )
-        # Cache for the Download button.
-        self._last_crop_bytes = data
-        self._crop_download_btn.setEnabled(True)
+        if update_preview:
+            # Update the Crop preview tab so the user can verify exactly what was sent.
+            pm = QPixmap()
+            pm.loadFromData(data)
+            self._crop_preview_img.setPixmap(pm.scaledToWidth(
+                min(pm.width(), 500), Qt.TransformationMode.SmoothTransformation
+            ))
+            kb = len(data) / 1024
+            self._crop_preview_meta.setText(
+                f"source crop: {orig_w}×{orig_h}    sent: {crop.width}×{crop.height}    "
+                f"size: {len(data):,} bytes ({kb:.1f} KB)"
+            )
+            # Cache for the Download button.
+            self._last_crop_bytes = data
+            self._crop_download_btn.setEnabled(True)
         return data
+
+    def _crop_search_box_to_jpeg(self, path: Path, max_dim: int = 1024) -> bytes | None:
+        """Back-compat wrapper for the single-image flow.
+
+        Returns the JPEG bytes of `path` cropped to self._search_box's scene rect, or
+        None when no search box is set. Called by: _refresh_visual_search().
+        """
+        if self._search_box is None:
+            return None
+        r = self._search_box.scene_rect()
+        return self._crop_image_to_rect_jpeg(
+            path,
+            (max(0, int(r.left())), max(0, int(r.top())),
+             int(r.width()), int(r.height())),
+            max_dim=max_dim,
+            update_preview=True,
+        )
 
     def _download_crop(self):
         """Save the most-recently-generated crop JPEG to disk via a file dialog.
@@ -1275,6 +1375,618 @@ class Main(QMainWindow):
             return
         self.statusBar().showMessage(f"Saved crop to {out}", 5000)
         _dbg(f"crop saved: {out} ({len(self._last_crop_bytes):,} bytes)")
+
+    # ------------------------------------------------------------------
+    # Bulk mode — iterate every bounding box in the loaded NDJSON, run
+    # visual search on each, render a single composite PNG report.
+    # ------------------------------------------------------------------
+
+    def _maybe_enable_bulk_mode(self):
+        """Enable the Bulk mode toolbar button iff both a folder + NDJSON are loaded.
+
+        Called from open_folder() and load_ndjson() — either order works.
+        """
+        ready = bool(self.image_paths) and bool(self.annotations)
+        self._bulk_action.setEnabled(ready)
+        if ready:
+            _dbg("bulk mode: enabled (folder + NDJSON loaded).")
+
+    def _object_to_display_rect(self, obj: dict) -> tuple[int, int, int, int] | None:
+        """Read an NDJSON object's bounding_box into a (left, top, width, height) tuple.
+
+        Mirrors the rect restoration in load_current(). Returns None if the dict is
+        missing required keys or contains non-numeric values.
+        Called by: _start_bulk_mode().
+        """
+        bb = obj.get("bounding_box") or {}
+        try:
+            return (int(bb["left"]), int(bb["top"]),
+                    int(bb["width"]), int(bb["height"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _extract_sku_from_entry(self, entry: dict) -> str:
+        """Pull the image-level SKU out of an annotations dict's classifications.
+
+        Returns "" if no SKU classification is present. Called by: _start_bulk_mode().
+        """
+        for c in (entry.get("annotations") or {}).get("classifications") or []:
+            if c.get("name") == "SKU":
+                return (c.get("text_answer") or {}).get("content", "").strip()
+        return ""
+
+    def _start_bulk_mode(self):
+        """Iterate every box in self.annotations, call visual search, build a report.
+
+        Steps:
+          1. Build a flat task list from self.annotations (one entry per box).
+          2. For each task: crop → POST → on 401 re-auth → record result.
+          3. Render a composite report image (PIL) and show it in a new tab.
+        Progress is reported via a modal QProgressDialog with a Cancel button.
+        Called by: self._bulk_action.triggered.
+        """
+        if not self.auth_token:
+            QMessageBox.warning(
+                self, "Bulk mode",
+                "Not authenticated — cannot run visual search.\n"
+                "Check .annotater_creds.json and restart the app."
+            )
+            return
+        if not self.image_paths or not self.annotations:
+            QMessageBox.information(
+                self, "Bulk mode",
+                "Load a folder of images and an NDJSON first."
+            )
+            return
+
+        # Save the current image's edits so anything in-memory matches NDJSON.
+        self._stash_current()
+
+        # Flatten: one task per bounding box.
+        by_name = {p.name: p for p in self.image_paths}
+        tasks: list[tuple[Path, str, tuple[int, int, int, int], int]] = []
+        for fname, entry in self.annotations.items():
+            path = by_name.get(fname)
+            if path is None:
+                continue
+            sku = self._extract_sku_from_entry(entry)
+            objs = (entry.get("annotations") or {}).get("objects") or []
+            for i, obj in enumerate(objs):
+                rect = self._object_to_display_rect(obj)
+                if rect is not None:
+                    tasks.append((path, sku, rect, i))
+
+        if not tasks:
+            QMessageBox.information(
+                self, "Bulk mode", "No bounding boxes found in the loaded annotations."
+            )
+            return
+
+        _dbg(f"bulk mode: {len(tasks)} boxes across {len({t[0] for t in tasks})} images")
+
+        dlg = QProgressDialog(
+            "Running visual search…", "Cancel", 0, len(tasks), self
+        )
+        dlg.setWindowTitle("Bulk mode")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+
+        results: list[BulkResult] = []
+        for i, (path, sku, rect, oi) in enumerate(tasks):
+            if dlg.wasCanceled():
+                _dbg(f"bulk mode: canceled after {i}/{len(tasks)} boxes")
+                break
+            dlg.setLabelText(f"{path.name}  box {oi+1}  ({i+1}/{len(tasks)})")
+            dlg.setValue(i)
+            QApplication.processEvents()
+
+            crop = self._crop_image_to_rect_jpeg(path, rect, update_preview=False)
+            if crop is None:
+                results.append(BulkResult(path, sku, rect, [], "crop failed"))
+                continue
+
+            payload, msg, code = goat_visual_search(crop, self.auth_token)
+            if code == 401:
+                _dbg("bulk mode: 401 — refreshing token…")
+                new_token, login_msg = goat_login()
+                _dbg(f"bulk mode: auth refresh: {login_msg}")
+                if new_token:
+                    self.auth_token = new_token
+                    payload, msg, code = goat_visual_search(crop, self.auth_token)
+            items = (payload or {}).get("catalog_items") or []
+            results.append(BulkResult(path, sku, rect, items, msg, crop_jpeg=crop))
+
+        dlg.setValue(len(tasks))
+
+        if not results:
+            self.statusBar().showMessage("Bulk mode: no results.", 5000)
+            return
+
+        self.statusBar().showMessage(
+            f"Bulk mode: {len(results)} boxes processed. Rendering report…", 5000
+        )
+        QApplication.processEvents()
+        self._render_bulk_report(results)
+
+    def _compute_stats(self, results: list[BulkResult]) -> dict:
+        """Compute the summary stats shown atop the bulk report.
+
+        Returns a dict with: n_boxes, n_images, n_multi_box_images, r_at_k (dict
+        for k in 1/3/5/10), mrr, miss_rate, histogram (Counter keyed by rank-int
+        or the string "miss"), max_rank (largest 1-indexed rank seen, for sizing
+        the histogram).
+        Called by: _render_bulk_report().
+        """
+        n = len(results)
+        if n == 0:
+            return {
+                "n_boxes": 0, "n_images": 0, "n_multi_box_images": 0,
+                "r_at_k": {1: 0, 3: 0, 5: 0, 10: 0},
+                "mrr": 0.0, "miss_rate": 0.0,
+                "histogram": Counter(), "max_rank": 0,
+            }
+        per_image = Counter(r.path for r in results)
+        ranks = [r.rank() for r in results]
+        hist = Counter()
+        for rk in ranks:
+            hist[(rk + 1) if rk is not None else "miss"] += 1
+        r_at_k = {}
+        for k in (1, 3, 5, 10):
+            r_at_k[k] = sum(1 for rk in ranks if rk is not None and rk < k) / n
+        mrr = sum(1.0 / (rk + 1) if rk is not None else 0.0 for rk in ranks) / n
+        miss = sum(1 for rk in ranks if rk is None) / n
+        numeric_ranks = [k for k in hist.keys() if isinstance(k, int)]
+        max_rank = max(numeric_ranks) if numeric_ranks else 0
+        return {
+            "n_boxes": n,
+            "n_images": len(per_image),
+            "n_multi_box_images": sum(1 for c in per_image.values() if c > 1),
+            "r_at_k": r_at_k,
+            "mrr": mrr,
+            "miss_rate": miss,
+            "histogram": hist,
+            "max_rank": max_rank,
+        }
+
+    def _render_bulk_report(self, results: list[BulkResult]):
+        """Build a composite PNG of the bulk results and show it in a new tab.
+
+        Layout: header (stats + histogram) followed by one row per BulkResult:
+        the cropped image on the left, then TOP_N catalog-item thumbnails to the
+        right. Ground-truth-matching thumbs are outlined in green.
+        Called by: _start_bulk_mode().
+        """
+        TOP_N = 10
+        ROW_H = 190  # taller row to fit filename + folder + sku + rank under the crop
+        CROP_W, CROP_H = 160, 130
+        THUMB_W, THUMB_H = 110, 110
+        THUMB_GAP = 8
+        ROW_PAD = 10
+        SIDE_PAD = 20
+
+        stats = self._compute_stats(results)
+
+        # --- 1. Fetch unique thumbnails (synchronous, with progress dialog) ---
+        unique_urls: list[str] = []
+        seen_urls: set[str] = set()
+        for r in results:
+            for it in r.items[:TOP_N]:
+                u = it.get("grid_glow_picture_url")
+                if u and u not in seen_urls:
+                    seen_urls.add(u)
+                    unique_urls.append(u)
+
+        thumb_cache: dict[str, Image.Image] = {}
+        dlg = QProgressDialog(
+            "Downloading thumbnails…", "Cancel", 0, max(1, len(unique_urls)), self
+        )
+        dlg.setWindowTitle("Bulk mode")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        for i, u in enumerate(unique_urls):
+            if dlg.wasCanceled():
+                break
+            dlg.setValue(i)
+            dlg.setLabelText(f"Downloading {i+1}/{len(unique_urls)}…")
+            QApplication.processEvents()
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": GOAT_USER_AGENT})
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                    raw = Image.open(io.BytesIO(resp.read()))
+                    # GOAT product PNGs have transparent backgrounds. A naive
+                    # .convert("RGB") fills transparency with black; composite
+                    # onto white instead so the report doesn't look like an LP.
+                    if raw.mode in ("RGBA", "LA") or (
+                        raw.mode == "P" and "transparency" in raw.info
+                    ):
+                        rgba = raw.convert("RGBA")
+                        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                        bg.paste(rgba, mask=rgba.split()[-1])
+                        img = bg
+                    else:
+                        img = raw.convert("RGB")
+                    thumb_cache[u] = img
+            except Exception as e:
+                _dbg(f"bulk thumb: failed to fetch {u[:60]}…: {type(e).__name__}")
+        dlg.setValue(len(unique_urls))
+
+        # --- 2. Resolve a font (Helvetica on macOS, fallback to default) ---
+        def _font(size: int) -> ImageFont.ImageFont:
+            for candidate in (
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Arial.ttf",
+            ):
+                try:
+                    return ImageFont.truetype(candidate, size)
+                except Exception:
+                    continue
+            return ImageFont.load_default()
+        font_title = _font(22)
+        font_h = _font(16)
+        font_body = _font(14)
+        font_small = _font(11)
+        font_mono = _font(13)
+
+        # --- 3. Compute canvas dimensions ---
+        # Histogram covers every rank from 1..max_rank plus "miss".
+        hist = stats["histogram"]
+        max_rank = stats["max_rank"]
+        hist_rows = max_rank + (1 if hist.get("miss", 0) else 0)
+        if hist_rows == 0:
+            hist_rows = 1  # avoid zero-height
+        # Count distinct folders for header sizing (matches the rendering below).
+        n_dirs = len({str(r.path.parent) for r in results})
+        if n_dirs <= 1:
+            folder_h = 22
+        else:
+            folder_h = 20 + 18 * min(n_dirs, 5) + (18 if n_dirs > 5 else 0)
+        header_h = 240 + folder_h + 22 * hist_rows + 40
+        rows_h = ROW_H * len(results) + ROW_PAD * (len(results) + 1)
+        total_h = header_h + rows_h + SIDE_PAD
+        total_w = SIDE_PAD + CROP_W + 16 + TOP_N * (THUMB_W + THUMB_GAP) + SIDE_PAD
+
+        canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        # --- 4. Header ---
+        y = SIDE_PAD
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        draw.text((SIDE_PAD, y), f"Bulk visual-search evaluation     {ts}",
+                  fill=(20, 20, 20), font=font_title)
+        y += 32
+        # Image folder(s) being evaluated — usually one (Open Folder), but if a
+        # user mixes images from multiple folders we show each distinct parent.
+        result_dirs: list[Path] = []
+        seen_dirs: set[str] = set()
+        for r in results:
+            d = r.path.parent
+            ds = str(d)
+            if ds not in seen_dirs:
+                seen_dirs.add(ds)
+                result_dirs.append(d)
+        if len(result_dirs) == 1:
+            draw.text((SIDE_PAD, y), f"Folder: {result_dirs[0]}",
+                      fill=(40, 40, 40), font=font_mono)
+            y += 22
+        elif result_dirs:
+            draw.text((SIDE_PAD, y), f"Folders ({len(result_dirs)}):",
+                      fill=(40, 40, 40), font=font_mono)
+            y += 20
+            for d in result_dirs[:5]:
+                draw.text((SIDE_PAD + 16, y), str(d),
+                          fill=(60, 60, 60), font=font_mono)
+                y += 18
+            if len(result_dirs) > 5:
+                draw.text((SIDE_PAD + 16, y),
+                          f"…and {len(result_dirs) - 5} more",
+                          fill=(120, 120, 120), font=font_mono)
+                y += 18
+        y += 8
+        draw.text((SIDE_PAD, y), "Dataset:", fill=(40, 40, 40), font=font_h)
+        y += 22
+        mpct = (
+            f" ({100*stats['n_multi_box_images']/stats['n_images']:.1f}%)"
+            if stats["n_images"] else ""
+        )
+        for line in [
+            f"  Images:                          {stats['n_images']}",
+            f"  Bounding boxes:                  {stats['n_boxes']}",
+            f"  Images with >1 bounding box:     {stats['n_multi_box_images']}{mpct}",
+        ]:
+            draw.text((SIDE_PAD, y), line, fill=(40, 40, 40), font=font_mono)
+            y += 20
+        y += 8
+
+        draw.text(
+            (SIDE_PAD, y),
+            f"Retrieval metrics (denominator = {stats['n_boxes']} boxes):",
+            fill=(40, 40, 40), font=font_h,
+        )
+        y += 22
+        rk = stats["r_at_k"]
+        draw.text(
+            (SIDE_PAD, y),
+            f"  R@1: {rk[1]*100:5.1f}%   R@3: {rk[3]*100:5.1f}%   "
+            f"R@5: {rk[5]*100:5.1f}%   R@10: {rk[10]*100:5.1f}%",
+            fill=(40, 40, 40), font=font_mono,
+        )
+        y += 20
+        draw.text(
+            (SIDE_PAD, y),
+            f"  MRR: {stats['mrr']:.3f}   Miss rate: {stats['miss_rate']*100:.1f}%",
+            fill=(40, 40, 40), font=font_mono,
+        )
+        y += 26
+
+        draw.text(
+            (SIDE_PAD, y),
+            "Rank distribution (count of boxes whose GT SKU landed at that rank; "
+            "\"miss\" = GT not returned):",
+            fill=(40, 40, 40), font=font_body,
+        )
+        y += 22
+        hist_total_max = max([hist[k] for k in hist] or [1])
+        bar_max_px = total_w - SIDE_PAD - 200
+        for r in range(1, max_rank + 1):
+            count = hist.get(r, 0)
+            bar = int(bar_max_px * count / hist_total_max) if hist_total_max else 0
+            draw.text((SIDE_PAD, y), f"  rank {r:>2}", fill=(40, 40, 40), font=font_mono)
+            if bar > 0:
+                draw.rectangle(
+                    [SIDE_PAD + 110, y + 3, SIDE_PAD + 110 + bar, y + 17],
+                    fill=(80, 130, 220),
+                )
+            draw.text((SIDE_PAD + 120 + bar, y), str(count),
+                      fill=(40, 40, 40), font=font_mono)
+            y += 22
+        if hist.get("miss", 0):
+            count = hist["miss"]
+            bar = int(bar_max_px * count / hist_total_max) if hist_total_max else 0
+            draw.text((SIDE_PAD, y), "  miss  ", fill=(180, 40, 40), font=font_mono)
+            if bar > 0:
+                draw.rectangle(
+                    [SIDE_PAD + 110, y + 3, SIDE_PAD + 110 + bar, y + 17],
+                    fill=(220, 90, 90),
+                )
+            draw.text((SIDE_PAD + 120 + bar, y), str(count),
+                      fill=(180, 40, 40), font=font_mono)
+            y += 22
+        y += 16
+        # divider line
+        draw.line([(SIDE_PAD, y), (total_w - SIDE_PAD, y)], fill=(200, 200, 200), width=1)
+        y += ROW_PAD
+
+        # --- 5. Per-box rows ---
+        for r in results:
+            row_top = y
+            # Crop on the left
+            if r.crop_jpeg:
+                try:
+                    crop_img = Image.open(io.BytesIO(r.crop_jpeg)).convert("RGB")
+                    crop_img.thumbnail((CROP_W, CROP_H), Image.Resampling.LANCZOS)
+                    cx = SIDE_PAD + (CROP_W - crop_img.width) // 2
+                    cy = row_top + (CROP_H - crop_img.height) // 2
+                    canvas.paste(crop_img, (cx, cy))
+                except Exception as e:
+                    draw.text((SIDE_PAD, row_top + 10), "(crop decode error)",
+                              fill=(180, 40, 40), font=font_small)
+            else:
+                draw.rectangle(
+                    [SIDE_PAD, row_top, SIDE_PAD + CROP_W, row_top + CROP_H],
+                    outline=(220, 220, 220), width=1,
+                )
+                draw.text((SIDE_PAD + 10, row_top + 10), "(no crop)",
+                          fill=(160, 160, 160), font=font_small)
+
+            # Filename + folder + SKU + rank under the crop. Truncate hard to the
+            # crop column width so labels never bleed into the thumbnail column.
+            def _fit(s: str, max_chars: int = 22) -> str:
+                return s if len(s) <= max_chars else s[: max_chars - 1] + "…"
+
+            label_y = row_top + CROP_H + 2
+            draw.text((SIDE_PAD, label_y),
+                      _fit(r.path.name),
+                      fill=(20, 20, 20), font=font_small)
+            draw.text((SIDE_PAD, label_y + 14),
+                      _fit(r.path.parent.name + "/", 22),
+                      fill=(90, 90, 90), font=font_small)
+            rk_val = r.rank()
+            if rk_val is None:
+                rank_text = "miss" if (r.gt_sku or "").strip() else "(no GT)"
+                rank_color = (180, 40, 40) if (r.gt_sku or "").strip() else (140, 140, 140)
+            else:
+                rank_text = f"★ rank {rk_val + 1}"
+                rank_color = (20, 140, 60)
+            draw.text((SIDE_PAD, label_y + 30),
+                      f"SKU: {_fit(r.gt_sku or '(empty)', 18)}",
+                      fill=(40, 40, 40), font=font_small)
+            draw.text((SIDE_PAD, label_y + 44), rank_text,
+                      fill=rank_color, font=font_small)
+
+            # Thumbnails on the right
+            gt = (r.gt_sku or "").strip().casefold()
+            tx_start = SIDE_PAD + CROP_W + 16
+            for ti in range(TOP_N):
+                tx = tx_start + ti * (THUMB_W + THUMB_GAP)
+                if ti >= len(r.items):
+                    # empty placeholder
+                    draw.rectangle(
+                        [tx, row_top, tx + THUMB_W, row_top + THUMB_H],
+                        outline=(230, 230, 230), width=1,
+                    )
+                    continue
+                item = r.items[ti]
+                item_sku = str(item.get("sku", "")).strip()
+                is_match = bool(gt) and item_sku.casefold() == gt
+                url = item.get("grid_glow_picture_url")
+                thumb = thumb_cache.get(url) if url else None
+                # Paste thumbnail (or grey box on failure)
+                if thumb is not None:
+                    t = thumb.copy()
+                    t.thumbnail((THUMB_W, THUMB_H), Image.Resampling.LANCZOS)
+                    px = tx + (THUMB_W - t.width) // 2
+                    py = row_top + (THUMB_H - t.height) // 2
+                    canvas.paste(t, (px, py))
+                else:
+                    draw.rectangle(
+                        [tx, row_top, tx + THUMB_W, row_top + THUMB_H],
+                        fill=(245, 245, 245), outline=(220, 220, 220), width=1,
+                    )
+                    draw.text((tx + 6, row_top + THUMB_H // 2 - 6),
+                              "no img", fill=(160, 160, 160), font=font_small)
+                # SKU label under the thumb
+                draw.text((tx, row_top + THUMB_H + 2),
+                          item_sku[:18] if item_sku else "(no sku)",
+                          fill=(40, 40, 40) if is_match else (90, 90, 90),
+                          font=font_small)
+                # Green outline for match
+                if is_match:
+                    draw.rectangle(
+                        [tx - 2, row_top - 2, tx + THUMB_W + 2, row_top + THUMB_H + 2],
+                        outline=(20, 160, 60), width=3,
+                    )
+            # Row separator
+            sep_y = row_top + ROW_H - 4
+            draw.line(
+                [(SIDE_PAD, sep_y), (total_w - SIDE_PAD, sep_y)],
+                fill=(235, 235, 235), width=1,
+            )
+            y = row_top + ROW_H + ROW_PAD
+
+        # --- 6. Encode to PNG bytes (for Download) and prepare on-screen tiles ---
+        # Qt's QPixmap caps individual textures at ~16384 px per side on macOS
+        # Metal — a tall bulk report (hundreds of rows) silently fails to load
+        # as a single QPixmap. Save the full-res PNG bytes for Download, and
+        # slice the canvas into vertical tiles for in-app display.
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG")
+        self._bulk_report_png_bytes = buf.getvalue()
+        # Build a single QPixmap when the canvas fits, otherwise leave it None
+        # and let the tile path handle display. Download uses the PNG bytes.
+        TILE_MAX_H = 8000  # comfortably under Qt's 16384 cap, leaves room for HiDPI
+        pm_full = QPixmap()
+        pm_full.loadFromData(self._bulk_report_png_bytes)
+        if pm_full.isNull() or canvas.height > TILE_MAX_H:
+            self._bulk_report_pixmap = None
+        else:
+            self._bulk_report_pixmap = pm_full
+
+        # Replace any existing bulk tab.
+        if self._bulk_tab_index is not None:
+            self._exit_bulk_mode()
+
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(QLabel(
+            f"<b>Bulk results</b> — {stats['n_boxes']} boxes / {stats['n_images']} images"
+        ), 1)
+        dl_btn = QPushButton("Download PNG")
+        dl_btn.clicked.connect(self._download_bulk_report)
+        top.addWidget(dl_btn, 0)
+        v.addLayout(top)
+
+        # Build the scrollable display: either a single QLabel, or a vertical
+        # stack of tile labels when the canvas is too tall for one QPixmap.
+        inner = QWidget()
+        inner_v = QVBoxLayout(inner)
+        inner_v.setContentsMargins(0, 0, 0, 0)
+        inner_v.setSpacing(0)
+        if self._bulk_report_pixmap is not None:
+            lbl = QLabel()
+            lbl.setPixmap(self._bulk_report_pixmap)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            inner_v.addWidget(lbl)
+        else:
+            # Slice canvas vertically and render each tile as its own QLabel.
+            y0 = 0
+            n_tiles = 0
+            while y0 < canvas.height:
+                y1 = min(y0 + TILE_MAX_H, canvas.height)
+                tile = canvas.crop((0, y0, canvas.width, y1))
+                tbuf = io.BytesIO()
+                tile.save(tbuf, format="PNG")
+                tpm = QPixmap()
+                tpm.loadFromData(tbuf.getvalue())
+                lbl = QLabel()
+                lbl.setPixmap(tpm)
+                lbl.setAlignment(
+                    Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+                )
+                inner_v.addWidget(lbl)
+                y0 = y1
+                n_tiles += 1
+            _dbg(f"bulk mode: report sliced into {n_tiles} tiles (Qt pixmap cap)")
+        inner_v.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        v.addWidget(scroll, 1)
+
+        idx = self._canvas_tabs.addTab(tab, "Bulk results")
+        self._bulk_tab_index = idx
+        self._canvas_tabs.setCurrentIndex(idx)
+        _dbg(
+            f"bulk mode: report rendered ({canvas.width}x{canvas.height} px, "
+            f"R@1={stats['r_at_k'][1]*100:.1f}%, miss={stats['miss_rate']*100:.1f}%)"
+        )
+
+    def _download_bulk_report(self):
+        """Save the most-recent bulk report image to disk via a file dialog.
+
+        Writes the full-resolution PNG bytes generated by PIL (not the on-screen
+        pixmap), so reports too tall for Qt's pixmap cap still save at full
+        quality. Called by: the "Download PNG" button on the Bulk results tab.
+        """
+        png_bytes = getattr(self, "_bulk_report_png_bytes", None)
+        if not png_bytes:
+            self.statusBar().showMessage("No bulk report to download.", 4000)
+            return
+        default = f"bulk_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save bulk report", default, "PNG (*.png);;JPEG (*.jpg)"
+        )
+        if not out:
+            return
+        try:
+            Path(out).write_bytes(png_bytes)
+        except OSError as e:
+            QMessageBox.warning(self, "Save failed", f"Could not write {out}:\n{e}")
+            return
+        self.statusBar().showMessage(f"Saved bulk report to {out}", 5000)
+        _dbg(f"bulk report saved: {out} ({len(png_bytes):,} bytes)")
+
+    def _on_canvas_tab_close(self, index: int):
+        """Handle tab-close clicks on the central QTabWidget.
+
+        Only the Bulk results tab is closeable (Annotate has no close button), so
+        any close click means "exit bulk mode". Called by:
+        self._canvas_tabs.tabCloseRequested.
+        """
+        if self._canvas_tabs.tabText(index) == "Bulk results":
+            self._exit_bulk_mode()
+
+    def _exit_bulk_mode(self):
+        """Remove the Bulk results tab and clear bulk state.
+
+        Called by: _on_canvas_tab_close() and _render_bulk_report() (when re-running).
+        """
+        if self._bulk_tab_index is not None:
+            w = self._canvas_tabs.widget(self._bulk_tab_index)
+            self._canvas_tabs.removeTab(self._bulk_tab_index)
+            if w is not None:
+                w.deleteLater()
+        self._bulk_tab_index = None
+        self._bulk_report_pixmap = None
+        self._bulk_report_png_bytes = None
+        self._canvas_tabs.setCurrentIndex(0)
 
     def _refresh_visual_search(self):
         """Crop the active search box, POST to visual-search, populate the carousel.
@@ -1694,6 +2406,7 @@ class Main(QMainWindow):
             if len(parse_errors) > 5:
                 lines.append(f"    …and {len(parse_errors) - 5} more")
         QMessageBox.information(self, "Load summary", "\n".join(lines))
+        self._maybe_enable_bulk_mode()
 
     def _to_export_row(self, filename: str, flat: dict) -> dict:
         """Wrap a flat internal annotation dict into a full Labelbox export-format row.
